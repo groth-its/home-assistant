@@ -7,6 +7,7 @@ https://home-assistant.io/components/light.flux_led/
 import logging
 import socket
 import random
+import colorsys
 
 import voluptuous as vol
 
@@ -23,6 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 
 CONF_AUTOMATIC_ADD = 'automatic_add'
 ATTR_MODE = 'mode'
+CONF_SEPARATE_WHITE = 'separate_white'
 
 DOMAIN = 'flux_led'
 
@@ -86,6 +88,7 @@ DEVICE_SCHEMA = vol.Schema({
         vol.All(cv.string, vol.In([MODE_RGBW, MODE_RGB])),
     vol.Optional(CONF_PROTOCOL):
         vol.All(cv.string, vol.In(['ledenet'])),
+    vol.Optional(CONF_SEPARATE_WHITE, default=False):  cv.boolean,
 })
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
@@ -106,8 +109,17 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
         device['ipaddr'] = ipaddr
         device[CONF_PROTOCOL] = device_config.get(CONF_PROTOCOL)
         device[ATTR_MODE] = device_config[ATTR_MODE]
-        light = FluxLight(device)
-        lights.append(light)
+        device[CONF_SEPARATE_WHITE] = device_config[CONF_SEPARATE_WHITE] 
+
+        if device[CONF_SEPARATE_WHITE]:
+          light = FluxLight(device, True)
+          lights.append(light)
+          light = FluxLight(device, False)
+          lights.append(light)
+        else:
+          light = FluxLight(device)
+          lights.append(light)
+
         light_ips.append(ipaddr)
 
     if not config.get(CONF_AUTOMATIC_ADD, False):
@@ -133,9 +145,18 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
 class FluxLight(Light):
     """Representation of a Flux light."""
 
-    def __init__(self, device):
+    def __init__(self, device, rgb_only=False):
         """Initialize the light."""
-        self._name = device['name']
+        if device[CONF_SEPARATE_WHITE] and rgb_only:
+          self._name = device['name'] + '_rgb'
+          self._brightness = 255
+        elif device[CONF_SEPARATE_WHITE]:
+          self._name = device['name'] + '_white'
+          self._brightness = 255
+        else:
+          self._name = device['name']
+        self._separate_white = device[CONF_SEPARATE_WHITE]
+        self._rgb_only = rgb_only
         self._ipaddr = device['ipaddr']
         self._protocol = device[CONF_PROTOCOL]
         self._mode = device[ATTR_MODE]
@@ -175,22 +196,41 @@ class FluxLight(Light):
     @property
     def is_on(self):
         """Return true if device is on."""
-        return self._bulb.isOn()
+        if self._separate_white and self._rgb_only:
+            self.update()
+            return colorsys.rgb_to_hsv(*self._bulb.getRgb())[2]
+        elif self._separate_white:
+            self.update()
+            return (self._bulb.getRgbw()[3] > 0)
+        else:
+            return self._bulb.isOn()
 
     @property
     def brightness(self):
         """Return the brightness of this light between 0..255."""
-        return self._bulb.brightness
+        if self._separate_white and self._rgb_only:
+            self.update()
+            return colorsys.rgb_to_hsv(*self._bulb.getRgb())[2]
+        else:
+            self.update()
+            return self._bulb.getRgbw()[3]
 
     @property
     def rgb_color(self):
         """Return the color property."""
-        return self._bulb.getRgb()
+        if self._separate_white and not self._rgb_only:
+            return None
+        else:
+            self.update()
+            return self._bulb.getRgb()
 
     @property
     def supported_features(self):
         """Flag supported features."""
-        return SUPPORT_FLUX_LED
+        if self._separate_white and not self._rgb_only:
+            return SUPPORT_BRIGHTNESS
+        else:
+            return SUPPORT_FLUX_LED
 
     @property
     def effect_list(self):
@@ -199,23 +239,38 @@ class FluxLight(Light):
 
     def turn_on(self, **kwargs):
         """Turn the specified or all lights on."""
-        if not self.is_on:
+        if not self._bulb.isOn:
             self._bulb.turnOn()
-
+        if self._separate_white and self._rgb_only:
+            self.update()
+            (red, green, blue) = self._bulb.getRgb()
+            self._bulb.setRgbw(r=red, g=green, b=blue, brightness=self._brightness, w=self._bulb.getRgbw()[3])
+        elif self._separate_white:
+            self.update()
+            (red, green, blue) = self._bulb.getRgb()
+            self._bulb.setRgbw(r=red, g=green, b=blue, w=self._brightness)
+  
         rgb = kwargs.get(ATTR_RGB_COLOR)
         brightness = kwargs.get(ATTR_BRIGHTNESS)
         effect = kwargs.get(ATTR_EFFECT)
 
         if rgb is not None and brightness is not None:
-            self._bulb.setRgb(*tuple(rgb), brightness=brightness)
+            self._bulb.setRgbw(*tuple(rgb), brightness=brightness, w=self._bulb.getRgbw()[3])
         elif rgb is not None:
-            self._bulb.setRgb(*tuple(rgb))
+            self._bulb.setRgbw(*tuple(rgb), w=self._bulb.getRgbw()[3])
         elif brightness is not None:
-            if self._mode == MODE_RGBW:
-                self._bulb.setWarmWhite255(brightness)
-            elif self._mode == MODE_RGB:
+            if self._separate_white and self._rgb_only:
+                self.update()
                 (red, green, blue) = self._bulb.getRgb()
-                self._bulb.setRgb(red, green, blue, brightness=brightness)
+                self._bulb.setRgbw(r=red, g=green, b=blue, brightness=brightness, w=self._bulb.getRgbw()[3])
+            elif self._mode == MODE_RGBW:
+                self.update()
+                (red, green, blue) = self._bulb.getRgb()
+                self._bulb.setRgbw(r=red, g=green, b=blue, w=brightness)
+            elif self._mode == MODE_RGB:
+                self.update()
+                (red, green, blue) = self._bulb.getRgb()
+                self._bulb.setRgbw(r=red, g=green, b=blue, brightness=brightness, w=self._bulb.getRgbw()[3])
         elif effect == EFFECT_RANDOM:
             self._bulb.setRgb(random.randint(0, 255),
                               random.randint(0, 255),
@@ -225,7 +280,18 @@ class FluxLight(Light):
 
     def turn_off(self, **kwargs):
         """Turn the specified or all lights off."""
-        self._bulb.turnOff()
+        if self._separate_white and self._rgb_only:
+            self.update()
+            (red, green, blue) = self._bulb.getRgb()
+            self._brightness = colorsys.rgb_to_hsv(*self._bulb.getRgb())[2]
+            self._bulb.setRgbw(r=red, g=green, b=blue, brightness=0, w=self._bulb.getRgbw()[3])
+        elif self._separate_white:
+            self.update()
+            (red, green, blue) = self._bulb.getRgb()
+            self._brightness = self._bulb.getRgbw()[3]
+            self._bulb.setRgbw(r=red, g=green, b=blue, w=0)
+        else:
+            self._bulb.turnOff()
 
     def update(self):
         """Synchronize state with bulb."""
